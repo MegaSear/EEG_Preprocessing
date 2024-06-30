@@ -14,6 +14,8 @@ import os
 from scipy.fft import fft
 from tools.montages import read_elc, align_head
 from autoreject import Ransac 
+from tools.analysis import rms_calculate, snr_calculate, snr_plot
+from matplotlib.gridspec import GridSpec
 
 def erps(raw_filtered):
     modes = ['without', 'central', 'space', 'all']
@@ -32,8 +34,8 @@ def erps(raw_filtered):
             events_not_congr = ['Stimulus/s153', 'Stimulus/s155']
 
         def erps_events(raw_filtered, events_congr, events_not_congr):
-            def make_events(target_stimuli, raw):
-                events, event_id = mne.events_from_annotations(raw)
+            def make_events(target_stimuli, raw, flag):
+                events, event_id = mne.events_from_annotations(raw, verbose=False)
                 desired_stimulus = 'Stimulus/s200'
                 target_stimuli_codes = dict(list(zip(event_id.values(), event_id.keys())))
                 filtered_events = []
@@ -42,63 +44,175 @@ def erps(raw_filtered):
                     next_event = events[i + 1]
                     if target_stimuli_codes[current_event[2]] in target_stimuli:
                         if target_stimuli_codes[next_event[2]] == desired_stimulus:
-                            filtered_events.append(next_event)
+                            filtered_events.append(current_event)
+                filtered_event_id = {stimulus: event_id[stimulus] for stimulus in target_stimuli if stimulus in event_id}
                 filtered_events = np.array(filtered_events)
-                epochs = mne.Epochs(raw, filtered_events, event_id={'Stimulus/s200':event_id['Stimulus/s200']}, tmin=-0.2, tmax=1.0, preload=True, 
+                epochs_noise = mne.Epochs(raw, filtered_events, event_id=filtered_event_id, tmin=-0.2, tmax=1.0, preload=True, 
                                     baseline=(None, 0), event_repeated='merge', verbose=False)
-                epochs.drop_bad()
-                return epochs
+                
+                rms_signal, rms_noise = rms_calculate(epochs_noise)
+                snr_matrix = snr_calculate(rms_signal, rms_noise, 'mean')
+                n_epochs = epochs_noise.get_data().shape[0]
+                ch_names = epochs_noise.ch_names
+                snr_plot(snr_matrix, list(range(n_epochs)), list(range(len(ch_names))), ch_names, save=f'SNR-{mode}-{flag}')
+                
+                threshold_ep = -25
+                threshold_elec = -28
 
-            epochs_c_noise = make_events(events_congr, raw_filtered)
-            epochs_n_noise = make_events(events_not_congr, raw_filtered)
-            reject_criteria = dict(eeg=130e-6)
-            epochs_c = epochs_c_noise.copy().drop_bad(reject=reject_criteria, verbose=False)
-            epochs_n = epochs_n_noise.copy().drop_bad(reject=reject_criteria, verbose=False)
-            drop_log = epochs_c_noise.drop_log
-            rejected_epochs = [i for i, log in enumerate(drop_log) if log]
-            print(f'Удаленные эпохи C: {rejected_epochs}')
-            drop_log = epochs_n_noise.drop_log
-            rejected_epochs = [i for i, log in enumerate(drop_log) if log]
-            print(f'Удаленные эпохи N: {rejected_epochs}')
+                # Вычисление среднего значения по каналам для каждой эпохи
+                mean_snr_per_epoch = np.mean(snr_matrix, axis=1)
+                # Нахождение индексов эпох, где среднее значение по каналам меньше порога
+                epochs_below_threshold = np.where(mean_snr_per_epoch < threshold_ep)[0]
+                print("Индексы эпох, где среднее значение по каналам меньше порога:", epochs_below_threshold)
+                # Для каждой интересующей нас эпохи, находим имена каналов, которые превысили threshold1
+                for epoch in range(n_epochs):
+                    channels_above_threshold1 = np.where(snr_matrix[epoch] < threshold_elec)[0]
+                    channel_names_above_threshold1 = [ch_names[ch] for ch in channels_above_threshold1]
+                    print(f"Эпоха {epoch}: Каналы, превысившие порог {threshold_elec}: {channel_names_above_threshold1}")
+                    
+                reject_criteria = dict(eeg=130e-6)
+                epochs_cleaned = epochs_noise.copy().drop_bad(reject=reject_criteria, verbose=False)
+                drop_log = epochs_cleaned.drop_log
+                rejected_epochs = [i for i, log in enumerate(drop_log) if log]
+                print(f'Удаленные эпохи {flag}: {rejected_epochs}')
+                return epochs_cleaned, rejected_epochs
+
+            epochs_c, rej_c = make_events(events_congr, raw_filtered, flag='c')
+            epochs_n, rej_n = make_events(events_not_congr, raw_filtered, flag='n')
             
-            erp = {#'P1':['P3', 'Pz', 'P4', 'POz', 'P1', 'P2'],
-                #'N1':['P3', 'Pz', 'P4', 'O1', 'Oz', 'O2'],
-                #'CNV':['FCz', 'Cz'],
-                #'N2':['P3', 'Pz', 'P4', 'POz', 'P1', 'P2'],
+            #ar = AutoReject(thresh_method='random_search', random_state=42)
+
+            #ar.fit(epochs_c)
+            #epochs_c = ar.transform(epochs_c)
+            #ar.fit(epochs_n)
+            #epochs_n = ar.transform(epochs_n)
+            erp = {'P1':['P3', 'Pz', 'P4', 'POz', 'P1', 'P2'],
+                'N1':['P3', 'Pz', 'P4', 'O1', 'Oz', 'O2'],
+                'CNV':['FCz', 'Cz'],
+                'N2':['P3', 'Pz', 'P4', 'POz', 'P1', 'P2'],
                 'P3':['P3', 'Pz', 'P4', 'POz', 'P1', 'P2'],}
-            fig, axs = plt.subplots(4, 2, figsize=(10, 15))  # Увеличенный размер для среднего графика
-            for ax, electrode in zip(axs.flatten()[:-2], erp['P3']):
-                mean_data_c = np.mean(epochs_c.average(picks=electrode, method='mean').data, axis=0)  
-                mean_data_n = np.mean(epochs_n.average(picks=electrode, method='mean').data, axis=0) 
-                sf = epochs_c.info['sfreq']  
-                baseline = 0.2 
-                t = np.arange(-baseline, len(mean_data_c)/sf - baseline, 1/sf)
-                ax.plot(t, mean_data_c, label='con', color='blue')
-                ax.plot(t, mean_data_n, label='n-con', color='red')
-                ax.set_ylim([-10*1e-6, 10*1e-6])
-                ax.set_title(f'ERP {electrode}')
-                ax.set_xlabel('Время (с)')
-                ax.set_ylabel('Амплитуда')
-                ax.axhline(0, color='black', linewidth=1)
-                ax.axvline(0, color='black', linewidth=1)  
-                ax.grid(True)
-                ax.legend()
-            mean_data_c_all = np.mean([epochs_c.average(picks=electrode, method='mean').data for electrode in erp['P3']], axis=0)
-            mean_data_n_all = np.mean([epochs_n.average(picks=electrode, method='mean').data for electrode in erp['P3']], axis=0)
-            t = np.arange(-baseline, len(mean_data_c_all[0])/sf - baseline, 1/sf)
-            axs[-1,0].plot(t, np.mean(mean_data_c_all, axis=0), label='con', color='blue', linestyle='--')
-            axs[-1,0].plot(t, np.mean(mean_data_n_all, axis=0), label='n-con', color='red', linestyle='--')
-            axs[-1,0].set_ylim([-10*1e-6, 10*1e-6])
-            axs[-1,0].set_title(f'ERP {mode} Среднее по электродам, C-{len(epochs_c)}/{len(epochs_c_noise)}, N-{len(epochs_n)}/{len(epochs_n_noise)}')
-            axs[-1,0].set_xlabel('Время (с)')
-            axs[-1,0].set_ylabel('Амплитуда')
-            axs[-1,0].axhline(0, color='black', linewidth=1)  
-            axs[-1,0].axvline(0, color='black', linewidth=1)  
-            axs[-1,0].grid(True)
-            axs[-1,0].legend()
+            electrodes_to_plot = erp['P3']
+            n_epochs_c = len(epochs_c)
+            n_epochs_n = len(epochs_n)
+            num_electrodes = len(electrodes_to_plot)
+            baseline = 0.2
+            sf = raw_filtered.info['sfreq'] 
+            n_fft= int(sf)
+
+            fig_erp = plt.figure(figsize=(16, 12))  # Изменим размер фигуры для сетки 4:2
+            gs_erp = GridSpec(4, 2, figure=fig_erp, hspace=0.7)
+            fig_erp.suptitle(f'ERP C:{n_epochs_c}/{n_epochs_c+len(rej_c)}, N:{n_epochs_n}/{n_epochs_n+len(rej_n)}')
+
+            for i, electrode in enumerate(electrodes_to_plot):
+                row, col = divmod(i, 2)
+                ax_erp = fig_erp.add_subplot(gs_erp[row, col])
+                data_c = epochs_c.get_data(picks=electrode)
+                data_n = epochs_n.get_data(picks=electrode)
+                mean_data_c = np.mean(data_c, axis=0).squeeze()
+                mean_data_n = np.mean(data_n, axis=0).squeeze()
+                std_c = np.std(data_c, axis=0).squeeze()
+                std_n = np.std(data_n, axis=0).squeeze()
+                print(mean_data_c.shape)
+                M_c = np.mean(mean_data_c, axis=0)
+                SD_c = np.std(mean_data_c, axis=0)
+                M_n = np.mean(mean_data_n, axis=0)
+                SD_n = np.std(mean_data_n, axis=0)
+                t = np.arange(-baseline, len(mean_data_c) / sf - baseline, 1 / sf)
+                # График ERP
+                ax_erp.plot(t, mean_data_c, label='con', color='blue')
+                ax_erp.plot(t, mean_data_n, label='n-con', color='red')
+                ax_erp.fill_between(t, mean_data_c - std_c, mean_data_c + std_c, color='blue', alpha=0.3)
+                ax_erp.fill_between(t, mean_data_n - std_n, mean_data_n + std_n, color='red', alpha=0.3)
+                ax_erp.set_ylim([-15 * 1e-6, 15 * 1e-6])
+                ax_erp.set_title(f'ERP {electrode}, C: {M_c*1e6:.2f}$\pm${SD_c*1e6:.2f} $\mu$V, N: {M_n*1e6:.2f}$\pm${SD_n*1e6:.2f} $\mu$V', fontsize=10)
+                ax_erp.set_xlabel('Время (с)', fontsize=8)
+                ax_erp.set_ylabel('Амплитуда', fontsize=8)
+                ax_erp.axhline(0, color='black', linewidth=1)
+                ax_erp.axvline(0, color='black', linewidth=1)
+                ax_erp.grid(True)
+                ax_erp.legend(fontsize=8)
+                ax_erp.set_box_aspect(0.2)  # Убедимся, что графики имеют одинаковое соотношение сторон
+
+            # Среднее по электродам ERP
+            mean_data_c_all = np.mean([epochs_c.average(picks=electrode, method='mean').data for electrode in erp['P3']], axis=0).squeeze()
+            mean_data_n_all = np.mean([epochs_n.average(picks=electrode, method='mean').data for electrode in erp['P3']], axis=0).squeeze()
+            SD_c_all = np.std([epochs_c.average(picks=electrode, method='mean').data for electrode in erp['P3']], axis=0).squeeze()
+            SD_n_all = np.std([epochs_n.average(picks=electrode, method='mean').data for electrode in erp['P3']], axis=0).squeeze()
+            M_c = np.mean(mean_data_c_all, axis=0)
+            SD_c = np.std(mean_data_c_all, axis=0)
+            M_n = np.mean(mean_data_n_all, axis=0)
+            SD_n = np.std(mean_data_n_all, axis=0)
+            t = np.arange(-baseline, len(mean_data_c_all) / sf - baseline, 1 / sf)
+
+            # Добавление графика среднего ERP с теневым контуром
+            ax_erp_avg = fig_erp.add_subplot(gs_erp[3, :])
+            ax_erp_avg.plot(t, mean_data_c_all, label='con', color='blue', linestyle='--')
+            ax_erp_avg.plot(t, mean_data_n_all, label='n-con', color='red', linestyle='--')
+
+            ax_erp_avg.fill_between(t, mean_data_c_all - SD_c_all,
+                                    mean_data_c_all + SD_c_all, color='blue', alpha=0.3)
+            ax_erp_avg.fill_between(t, mean_data_n_all - SD_n_all,
+                                    mean_data_n_all + SD_n_all, color='red', alpha=0.3)
+
+            ax_erp_avg.set_ylim([-15 * 1e-6, 15 * 1e-6])
+            ax_erp_avg.set_title(f'ERP Среднее по электродам, C: {M_c*1e6:.2f}$\pm${SD_c*1e6:.2f} $\mu$V, N: {M_n*1e6:.2f}$\pm${SD_n*1e6:.2f} $\mu$V', fontsize=10)
+            ax_erp_avg.set_xlabel('Время (с)', fontsize=8)
+            ax_erp_avg.set_ylabel('Амплитуда', fontsize=8)
+            ax_erp_avg.axhline(0, color='black', linewidth=1)
+            ax_erp_avg.axvline(0, color='black', linewidth=1)
+            ax_erp_avg.grid(True)
+            ax_erp_avg.legend(fontsize=8)
+            ax_erp_avg.set_box_aspect(0.2)
+
             plt.tight_layout()
             plt.show()
-            fig.savefig(f'P3-{mode}.png')
+            fig_erp.savefig(f'ERP_P3_{mode}.png')
+            # Создаем второе окно для PSD
+            fig_psd = plt.figure(figsize=(16, 12))  # Изменим размер фигуры для сетки 4:2
+            gs_psd = GridSpec(4, 2, figure=fig_psd, hspace=0.7)
+            fig_psd.suptitle('PSD')
+            for i, electrode in enumerate(electrodes_to_plot):
+                row, col = divmod(i, 2)
+                ax_psd = fig_psd.add_subplot(gs_psd[row, col])
+
+                mean_data_c = np.mean(epochs_c.average(picks=electrode, method='mean').data, axis=0)
+                mean_data_n = np.mean(epochs_n.average(picks=electrode, method='mean').data, axis=0)
+                
+                # Расчет и график спектра
+                psd_c, freqs_c = mne.time_frequency.psd_array_welch(mean_data_c, sfreq=sf, fmin=0, fmax=50, n_fft=n_fft)
+                psd_n, freqs_n = mne.time_frequency.psd_array_welch(mean_data_n, sfreq=sf, fmin=0, fmax=50, n_fft=n_fft)
+
+                ax_psd.plot(freqs_c, 10 * np.log10(psd_c), label='con', color='blue')
+                ax_psd.plot(freqs_n, 10 * np.log10(psd_n), label='n-con', color='red')
+                ax_psd.set_title(f'PSD {electrode}', fontsize=10)
+                ax_psd.set_xlabel('Частота (Гц)', fontsize=8)
+                ax_psd.set_ylabel('Мощность (дБ)', fontsize=8)
+                ax_psd.axhline(-100, color='black', linewidth=1)
+                ax_psd.axvline(0, color='black', linewidth=1)
+                ax_psd.grid(True)
+                ax_psd.legend(fontsize=8)
+                ax_psd.set_box_aspect(0.2)  # Убедимся, что графики имеют одинаковое соотношение сторон
+
+            # Среднее по электродам PSD
+            psd_c_all, freqs_c_all = mne.time_frequency.psd_array_welch(mean_data_c_all, sfreq=sf, fmin=0, fmax=50, n_fft=n_fft)
+            psd_n_all, freqs_n_all = mne.time_frequency.psd_array_welch(mean_data_n_all, sfreq=sf, fmin=0, fmax=50, n_fft=n_fft)
+
+            ax_psd_avg = fig_psd.add_subplot(gs_psd[3, :])
+            ax_psd_avg.plot(freqs_c_all, 10 * np.log10(psd_c_all), label='con', color='blue', linestyle='--')
+            ax_psd_avg.plot(freqs_n_all, 10 * np.log10(psd_n_all), label='n-con', color='red', linestyle='--')
+            ax_psd_avg.set_title(f'PSD Среднее по электродам', fontsize=10)
+            ax_psd_avg.set_xlabel('Частота (Гц)', fontsize=8)
+            ax_psd_avg.set_ylabel('Мощность (дБ)', fontsize=8)
+            ax_psd_avg.axhline(-100, color='black', linewidth=1)
+            ax_psd_avg.axvline(0, color='black', linewidth=1)
+            ax_psd_avg.grid(True)
+            ax_psd_avg.legend(fontsize=8)
+            ax_psd_avg.set_box_aspect(0.1)
+            
+            plt.tight_layout()
+            plt.show()
+            fig_psd.savefig(f'PSD_P3_{mode}.png')
+
         erps_events(raw_filtered, events_congr, events_not_congr)
 
 class Transform:
@@ -171,18 +285,20 @@ class FilterBandpass(Transform):
         return raw
 
 class SetMontage(Transform):
-    def __init__(self, montage, elc_file=None, mode='Cz', vis=False, threshold=0.08):
+    def __init__(self, montage, elc_file=None, mode='Cz', vis=False, threshold=0.08, interpolate=True):
         self.montage = montage
         self.elc_file = elc_file
         self.vis = vis
         self.mode = mode
         self.threshold = threshold
+        self.interpolate = interpolate
     def forward(self, raw):
         if self.montage=='waveguard64':
             montage = create_custom_montage(self.montage)
         elif self.montage == 'personal':
             ch_dict, nasion, lpa, rpa, hsp = read_elc(self.elc_file)
-            ch_dict, nasion, lpa, rpa, hsp = align_head(ch_dict, nasion, np.array(lpa), np.array(rpa), np.array(hsp), standard='waveguard64', 
+            if self.interpolate:
+                ch_dict, nasion, lpa, rpa, hsp = align_head(ch_dict, nasion, np.array(lpa), np.array(rpa), np.array(hsp), standard='waveguard64', 
                                                         mode=self.mode, threshold=self.threshold)
             montage = mne.channels.make_dig_montage(ch_pos=ch_dict, nasion=nasion, lpa=lpa, rpa=rpa, hsp=hsp, coord_frame='head')
         else:
